@@ -20,7 +20,7 @@ from google.genai import types
 
 app = FastAPI(title="Receitas Mauro AI")
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 class URLBody(BaseModel):
     url: str
