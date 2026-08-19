@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -67,6 +68,35 @@ REGRAS OBRIGATÓRIAS:
 - Usa unidades práticas: g, kg, ml, L, unidade, colher de sopa, colher de chá, chávena.
 """
 
+
+def generate_with_retry(*, contents, config=None):
+    delays = (2, 5, 10, 20)
+    last_error = None
+
+    for attempt in range(len(delays) + 1):
+        try:
+            kwargs = {
+                "model": MODEL,
+                "contents": contents,
+            }
+            if config is not None:
+                kwargs["config"] = config
+            return client.models.generate_content(**kwargs)
+        except Exception as exc:
+            last_error = exc
+            msg = str(exc).lower()
+            is_temporary = (
+                "503" in msg
+                or "unavailable" in msg
+                or "high demand" in msg
+                or "temporarily" in msg
+            )
+            if not is_temporary or attempt >= len(delays):
+                raise
+            time.sleep(delays[attempt])
+
+    raise last_error
+
 def clean_json(text: str) -> dict[str, Any]:
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
@@ -84,8 +114,7 @@ def call_recipe_ai(text: str, source_url: str = "", source_type: str = "", image
     for image in images or []:
         mime = mimetypes.guess_type(image.name)[0] or "image/jpeg"
         parts.append(types.Part.from_bytes(data=image.read_bytes(), mime_type=mime))
-    r = client.models.generate_content(
-        model=MODEL,
+    r = generate_with_retry(
         contents=[types.Content(role="user", parts=parts)],
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
@@ -97,8 +126,7 @@ def call_recipe_ai(text: str, source_url: str = "", source_type: str = "", image
 def transcribe_audio(path: Path) -> str:
     # Envia o áudio diretamente para o Gemini; evita serviços de transcrição pagos separados.
     mime = mimetypes.guess_type(path.name)[0] or "audio/mpeg"
-    r = client.models.generate_content(
-        model=MODEL,
+    r = generate_with_retry(
         contents=[types.Content(role="user", parts=[
             types.Part.from_text(text="Transcreve fielmente o áudio deste vídeo. Mantém nomes de ingredientes, quantidades, tempos e temperaturas."),
             types.Part.from_bytes(data=path.read_bytes(), mime_type=mime),
