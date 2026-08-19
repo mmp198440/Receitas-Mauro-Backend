@@ -1,5 +1,6 @@
 import base64
 import json
+import html
 import mimetypes
 import os
 import re
@@ -8,6 +9,8 @@ import subprocess
 import tempfile
 import time
 import uuid
+import urllib.request
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -161,6 +164,83 @@ def video_context(video: Path, work: Path):
 def health():
     return {"ok": True}
 
+
+def _normalise_social_url(url: str) -> str:
+    """Remove tracking query parameters that can confuse extractors."""
+    try:
+        parsed = urllib.parse.urlsplit(url.strip())
+        host = parsed.netloc.lower()
+        if "instagram.com" in host:
+            # Keep only the canonical reel/post path.
+            m = re.search(r"/(reel|p|tv)/([^/?#]+)/?", parsed.path)
+            if m:
+                return f"https://www.instagram.com/{m.group(1)}/{m.group(2)}/"
+        return urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+    except Exception:
+        return url.strip()
+
+
+def _download_instagram_embed(url: str, work: Path) -> tuple[Path | None, str]:
+    """Fallback for public Instagram posts/reels using the embed page."""
+    m = re.search(r"instagram\.com/(?:reel|p|tv)/([^/?#]+)", url)
+    if not m:
+        return None, ""
+    shortcode = m.group(1)
+    embed_url = f"https://www.instagram.com/reel/{shortcode}/embed/"
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Linux; Android 16; Mobile) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/139.0 Mobile Safari/537.36"
+        ),
+        "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
+        "Referer": "https://www.instagram.com/",
+    }
+
+    try:
+        req = urllib.request.Request(embed_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=25) as resp:
+            page = resp.read().decode("utf-8", errors="ignore")
+    except Exception:
+        return None, ""
+
+    # Capture description/title as useful fallback context.
+    description = ""
+    for pattern in (
+        r'<meta[^>]+property=["\']og:description["\'][^>]+content=["\']([^"\']*)',
+        r'<meta[^>]+name=["\']description["\'][^>]+content=["\']([^"\']*)',
+    ):
+        mm = re.search(pattern, page, flags=re.I)
+        if mm:
+            description = html.unescape(mm.group(1))
+            break
+
+    # Public embed pages sometimes expose the actual mp4 via og:video.
+    video_url = None
+    for pattern in (
+        r'<meta[^>]+property=["\']og:video(?::secure_url)?["\'][^>]+content=["\']([^"\']+)',
+        r'"video_url"\s*:\s*"([^"]+)"',
+    ):
+        mm = re.search(pattern, page, flags=re.I)
+        if mm:
+            video_url = html.unescape(mm.group(1)).replace(r"\/", "/")
+            break
+
+    if not video_url:
+        return None, description
+
+    try:
+        out = work / "instagram_fallback.mp4"
+        req = urllib.request.Request(video_url, headers=headers)
+        with urllib.request.urlopen(req, timeout=60) as resp, out.open("wb") as f:
+            shutil.copyfileobj(resp, f)
+        if out.exists() and out.stat().st_size > 20_000:
+            return out, description
+    except Exception:
+        pass
+
+    return None, description
+
+
 @app.post("/extract/text")
 def extract_text(body: TextBody):
     if not body.text.strip():
@@ -171,19 +251,34 @@ def extract_text(body: TextBody):
 def extract_url(body: URLBody):
     if not body.url.startswith(("http://", "https://")):
         raise HTTPException(400, "URL inválido")
+
+    url = _normalise_social_url(body.url)
+
     with tempfile.TemporaryDirectory() as td:
         work = Path(td)
         template = str(work / "source.%(ext)s")
+
+        cmd = [
+            "yt-dlp",
+            "--no-playlist",
+            "--write-description",
+            "--write-info-json",
+            "--retries", "3",
+            "--fragment-retries", "3",
+            "--extractor-retries", "3",
+            "--sleep-requests", "1",
+            "--impersonate", "chrome",
+            "-o", template,
+            url,
+        ]
+
         result = subprocess.run(
-            ["yt-dlp", "--no-playlist", "--write-description", "--write-info-json", "-o", template, body.url],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            timeout=180,
         )
-        if result.returncode != 0:
-            return call_recipe_ai(
-                f"Foi fornecido este link de uma receita/vídeo: {body.url}. Se não houver conteúdo suficiente, indica nas notas que o utilizador deve importar o vídeo diretamente.",
-                source_url=body.url,
-                source_type="link",
-            )
 
         info_text = ""
         for p in work.iterdir():
@@ -197,16 +292,50 @@ def extract_url(body: URLBody):
                 except Exception:
                     pass
 
-        videos = [p for p in work.iterdir() if p.suffix.lower() in {".mp4", ".webm", ".mkv", ".mov", ".m4v"}]
+        videos = [
+            p for p in work.iterdir()
+            if p.suffix.lower() in {".mp4", ".webm", ".mkv", ".mov", ".m4v"}
+        ]
+
+        # Instagram frequently blocks datacenter IPs/API metadata. Try the public embed page.
+        if not videos and "instagram.com" in url.lower():
+            fallback_video, fallback_description = _download_instagram_embed(url, work)
+            if fallback_description:
+                info_text += "\nDESCRIÇÃO INSTAGRAM:\n" + fallback_description
+            if fallback_video is not None:
+                videos = [fallback_video]
+
         if videos:
             transcript, frames = video_context(videos[0], work)
             return call_recipe_ai(
                 f"{info_text}\nTRANSCRIÇÃO DO ÁUDIO:\n{transcript}",
-                source_url=body.url,
-                source_type="vídeo online",
-                images=frames,
+                source_url=url,
+                source_type="link",
+                image_paths=frames,
             )
-        return call_recipe_ai(info_text or body.url, source_url=body.url, source_type="link")
+
+        # If yt-dlp could at least retrieve useful metadata, let Gemini build the recipe from it.
+        if info_text.strip():
+            return call_recipe_ai(
+                info_text,
+                source_url=url,
+                source_type="link",
+            )
+
+        # Final graceful fallback with actionable note.
+        stderr_tail = (result.stderr or "")[-1200:]
+        return call_recipe_ai(
+            (
+                f"Foi fornecido este link de uma receita/vídeo: {url}. "
+                "Não foi possível obter o vídeo ou descrição automaticamente. "
+                "Nas notas, explica que o Instagram pode bloquear servidores externos e "
+                "que o utilizador pode importar o vídeo diretamente no telefone. "
+                f"Detalhe técnico: {stderr_tail}"
+            ),
+            source_url=url,
+            source_type="link",
+        )
+
 
 @app.post("/extract/file")
 async def extract_file(file: UploadFile = File(...)):
