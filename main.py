@@ -311,7 +311,7 @@ def extract_url(body: URLBody):
                 f"{info_text}\nTRANSCRIÇÃO DO ÁUDIO:\n{transcript}",
                 source_url=url,
                 source_type="link",
-                image_paths=frames,
+                images=frames,
             )
 
         # If yt-dlp could at least retrieve useful metadata, let Gemini build the recipe from it.
