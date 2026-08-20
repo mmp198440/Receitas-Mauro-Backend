@@ -29,6 +29,7 @@ GEMINI_TIMEOUT_SECONDS = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "75"))
 
 def _gemini_generate_with_timeout(**kwargs):
     """Executa uma única chamada ao Gemini com timeout rígido."""
+    print(f"[GEMINI] CHAMADA REAL | modelo={kwargs.get('model', MODEL)} | {datetime.now().isoformat()}", flush=True)
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         future = executor.submit(client.models.generate_content, **kwargs)
         try:
