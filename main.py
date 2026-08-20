@@ -1,4 +1,5 @@
 import base64
+import concurrent.futures
 import json
 import mimetypes
 import os
@@ -6,13 +7,13 @@ import re
 import shutil
 import subprocess
 import tempfile
-import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pypdf import PdfReader
 from docx import Document
@@ -21,7 +22,24 @@ from google.genai import types
 
 app = FastAPI(title="Receitas Mauro AI")
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
+MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+
+
+GEMINI_TIMEOUT_SECONDS = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "75"))
+
+def _gemini_generate_with_timeout(**kwargs):
+    """Executa uma única chamada ao Gemini com timeout rígido."""
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(client.models.generate_content, **kwargs)
+        try:
+            return future.result(timeout=GEMINI_TIMEOUT_SECONDS)
+        except concurrent.futures.TimeoutError as exc:
+            future.cancel()
+            raise HTTPException(
+                status_code=504,
+                detail=f"O Gemini demorou mais de {GEMINI_TIMEOUT_SECONDS} segundos a responder. Tenta novamente.",
+            ) from exc
+
 
 class URLBody(BaseModel):
     url: str
@@ -68,35 +86,6 @@ REGRAS OBRIGATÓRIAS:
 - Usa unidades práticas: g, kg, ml, L, unidade, colher de sopa, colher de chá, chávena.
 """
 
-
-def generate_with_retry(*, contents, config=None):
-    delays = (2, 5, 10, 20)
-    last_error = None
-
-    for attempt in range(len(delays) + 1):
-        try:
-            kwargs = {
-                "model": MODEL,
-                "contents": contents,
-            }
-            if config is not None:
-                kwargs["config"] = config
-            return client.models.generate_content(**kwargs)
-        except Exception as exc:
-            last_error = exc
-            msg = str(exc).lower()
-            is_temporary = (
-                "503" in msg
-                or "unavailable" in msg
-                or "high demand" in msg
-                or "temporarily" in msg
-            )
-            if not is_temporary or attempt >= len(delays):
-                raise
-            time.sleep(delays[attempt])
-
-    raise last_error
-
 def clean_json(text: str) -> dict[str, Any]:
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
@@ -114,7 +103,8 @@ def call_recipe_ai(text: str, source_url: str = "", source_type: str = "", image
     for image in images or []:
         mime = mimetypes.guess_type(image.name)[0] or "image/jpeg"
         parts.append(types.Part.from_bytes(data=image.read_bytes(), mime_type=mime))
-    r = generate_with_retry(
+    r = _gemini_generate_with_timeout(
+        model=MODEL,
         contents=[types.Content(role="user", parts=parts)],
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
@@ -126,7 +116,8 @@ def call_recipe_ai(text: str, source_url: str = "", source_type: str = "", image
 def transcribe_audio(path: Path) -> str:
     # Envia o áudio diretamente para o Gemini; evita serviços de transcrição pagos separados.
     mime = mimetypes.guess_type(path.name)[0] or "audio/mpeg"
-    r = generate_with_retry(
+    r = _gemini_generate_with_timeout(
+        model=MODEL,
         contents=[types.Content(role="user", parts=[
             types.Part.from_text(text="Transcreve fielmente o áudio deste vídeo. Mantém nomes de ingredientes, quantidades, tempos e temperaturas."),
             types.Part.from_bytes(data=path.read_bytes(), mime_type=mime),
@@ -156,6 +147,33 @@ def video_context(video: Path, work: Path):
         check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
     return transcript, sorted(frames_dir.glob("*.jpg"))[:10]
+
+
+@app.exception_handler(Exception)
+async def _backend_exception_handler(request, exc):
+    msg = str(exc)
+    low = msg.lower()
+
+    if "resource_exhausted" in low or "429" in low or "quota" in low:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Limite diário gratuito do Gemini atingido. Tenta novamente depois da renovação da quota."},
+        )
+
+    if "503" in low or "unavailable" in low or "high demand" in low:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "O Gemini está temporariamente sobrecarregado. Tenta novamente daqui a pouco."},
+        )
+
+    if isinstance(exc, HTTPException):
+        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
+
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Erro interno no serviço de receitas."},
+    )
+
 
 @app.get("/health")
 def health():
