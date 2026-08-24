@@ -1,5 +1,4 @@
 import base64
-import concurrent.futures
 import json
 import mimetypes
 import os
@@ -7,13 +6,13 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, File, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from pypdf import PdfReader
 from docx import Document
@@ -22,24 +21,7 @@ from google.genai import types
 
 app = FastAPI(title="Receitas Mauro AI")
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
-MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
-
-
-GEMINI_TIMEOUT_SECONDS = int(os.getenv("GEMINI_TIMEOUT_SECONDS", "75"))
-
-def _gemini_generate_with_timeout(**kwargs):
-    """Executa uma única chamada ao Gemini com timeout rígido."""
-    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(client.models.generate_content, **kwargs)
-        try:
-            return future.result(timeout=GEMINI_TIMEOUT_SECONDS)
-        except concurrent.futures.TimeoutError as exc:
-            future.cancel()
-            raise HTTPException(
-                status_code=504,
-                detail=f"O Gemini demorou mais de {GEMINI_TIMEOUT_SECONDS} segundos a responder. Tenta novamente.",
-            ) from exc
-
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 
 class URLBody(BaseModel):
     url: str
@@ -86,6 +68,35 @@ REGRAS OBRIGATÓRIAS:
 - Usa unidades práticas: g, kg, ml, L, unidade, colher de sopa, colher de chá, chávena.
 """
 
+
+def generate_with_retry(*, contents, config=None):
+    delays = (2, 5, 10, 20)
+    last_error = None
+
+    for attempt in range(len(delays) + 1):
+        try:
+            kwargs = {
+                "model": MODEL,
+                "contents": contents,
+            }
+            if config is not None:
+                kwargs["config"] = config
+            return client.models.generate_content(**kwargs)
+        except Exception as exc:
+            last_error = exc
+            msg = str(exc).lower()
+            is_temporary = (
+                "503" in msg
+                or "unavailable" in msg
+                or "high demand" in msg
+                or "temporarily" in msg
+            )
+            if not is_temporary or attempt >= len(delays):
+                raise
+            time.sleep(delays[attempt])
+
+    raise last_error
+
 def clean_json(text: str) -> dict[str, Any]:
     text = text.strip()
     text = re.sub(r"^```(?:json)?\s*", "", text, flags=re.I)
@@ -98,13 +109,12 @@ def clean_json(text: str) -> dict[str, Any]:
     data["created_at"] = data.get("created_at") or datetime.now().isoformat()
     return data
 
-def call_recipe_ai(text: str, source_url: str = "", source_type: str = "", images: list[Path] | None = None, media: list[Path] | None = None):
-    parts = [types.Part.from_text(text=f"Analisa todo o conteúdo fornecido (texto, áudio e imagens) e transforma-o diretamente numa receita estruturada. Se houver áudio, extrai dele ingredientes, quantidades, tempos e preparação sem fazer uma transcrição separada.\n{SCHEMA_HINT}\n\nFONTE:\n{text}\n\nURL original: {source_url}\nTipo de fonte: {source_type}")]
-    for item in (media or []) + (images or []):
-        mime = mimetypes.guess_type(item.name)[0] or "application/octet-stream"
-        parts.append(types.Part.from_bytes(data=item.read_bytes(), mime_type=mime))
-    r = _gemini_generate_with_timeout(
-        model=MODEL,
+def call_recipe_ai(text: str, source_url: str = "", source_type: str = "", images: list[Path] | None = None):
+    parts = [types.Part.from_text(text=f"Transforma a informação abaixo numa receita estruturada.\n{SCHEMA_HINT}\n\nFONTE:\n{text}\n\nURL original: {source_url}\nTipo de fonte: {source_type}")]
+    for image in images or []:
+        mime = mimetypes.guess_type(image.name)[0] or "image/jpeg"
+        parts.append(types.Part.from_bytes(data=image.read_bytes(), mime_type=mime))
+    r = generate_with_retry(
         contents=[types.Content(role="user", parts=parts)],
         config=types.GenerateContentConfig(response_mime_type="application/json"),
     )
@@ -116,8 +126,7 @@ def call_recipe_ai(text: str, source_url: str = "", source_type: str = "", image
 def transcribe_audio(path: Path) -> str:
     # Envia o áudio diretamente para o Gemini; evita serviços de transcrição pagos separados.
     mime = mimetypes.guess_type(path.name)[0] or "audio/mpeg"
-    r = _gemini_generate_with_timeout(
-        model=MODEL,
+    r = generate_with_retry(
         contents=[types.Content(role="user", parts=[
             types.Part.from_text(text="Transcreve fielmente o áudio deste vídeo. Mantém nomes de ingredientes, quantidades, tempos e temperaturas."),
             types.Part.from_bytes(data=path.read_bytes(), mime_type=mime),
@@ -135,42 +144,18 @@ def extract_docx(path: Path) -> str:
 
 def video_context(video: Path, work: Path):
     audio = work / "audio.mp3"
-    subprocess.run(["ffmpeg", "-y", "-i", str(video), "-vn", "-acodec", "libmp3lame", "-q:a", "4", str(audio)], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(video), "-vn", "-acodec", "libmp3lame", "-q:a", "4", str(audio)],
+        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+    )
+    transcript = transcribe_audio(audio) if audio.exists() and audio.stat().st_size > 0 else ""
     frames_dir = work / "frames"
     frames_dir.mkdir(exist_ok=True)
-    subprocess.run(["ffmpeg", "-y", "-i", str(video), "-vf", "fps=1/8,scale=768:-1", "-frames:v", "10", str(frames_dir / "frame_%02d.jpg")], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-    media = []
-    if audio.exists() and audio.stat().st_size > 0:
-        media.append(audio)
-    media.extend(sorted(frames_dir.glob("*.jpg"))[:10])
-    return media
-
-
-@app.exception_handler(Exception)
-async def _backend_exception_handler(request, exc):
-    msg = str(exc)
-    low = msg.lower()
-
-    if "resource_exhausted" in low or "429" in low or "quota" in low:
-        return JSONResponse(
-            status_code=429,
-            content={"detail": "Limite diário gratuito do Gemini atingido. Tenta novamente depois da renovação da quota."},
-        )
-
-    if "503" in low or "unavailable" in low or "high demand" in low:
-        return JSONResponse(
-            status_code=503,
-            content={"detail": "O Gemini está temporariamente sobrecarregado. Tenta novamente daqui a pouco."},
-        )
-
-    if isinstance(exc, HTTPException):
-        return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
-
-    return JSONResponse(
-        status_code=500,
-        content={"detail": "Erro interno no serviço de receitas."},
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(video), "-vf", "fps=1/8,scale=768:-1", "-frames:v", "10", str(frames_dir / "frame_%02d.jpg")],
+        check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
     )
-
+    return transcript, sorted(frames_dir.glob("*.jpg"))[:10]
 
 @app.get("/health")
 def health():
@@ -214,12 +199,12 @@ def extract_url(body: URLBody):
 
         videos = [p for p in work.iterdir() if p.suffix.lower() in {".mp4", ".webm", ".mkv", ".mov", ".m4v"}]
         if videos:
-            media = video_context(videos[0], work)
+            transcript, frames = video_context(videos[0], work)
             return call_recipe_ai(
-                info_text,
+                f"{info_text}\nTRANSCRIÇÃO DO ÁUDIO:\n{transcript}",
                 source_url=body.url,
                 source_type="vídeo online",
-                media=media,
+                images=frames,
             )
         return call_recipe_ai(info_text or body.url, source_url=body.url, source_type="link")
 
@@ -241,6 +226,6 @@ async def extract_file(file: UploadFile = File(...)):
         if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
             return call_recipe_ai("Analisa esta imagem e extrai a receita visível.", source_type="imagem", images=[path])
         if suffix in {".mp4", ".mov", ".m4v", ".webm", ".mkv"}:
-            media = video_context(path, work)
-            return call_recipe_ai("Extrai diretamente a receita deste vídeo usando o áudio e as imagens.", source_type="vídeo importado", media=media)
+            transcript, frames = video_context(path, work)
+            return call_recipe_ai(f"TRANSCRIÇÃO DO ÁUDIO:\n{transcript}", source_type="vídeo importado", images=frames)
         raise HTTPException(400, f"Formato não suportado: {suffix}")
